@@ -4,15 +4,28 @@ name: SSH Workspace
 on:
   workflow_dispatch:
     inputs:
+      method:
+        description: "Jalur SSH (auto = tmate kalau terjangkau, kalau tidak upterm)"
+        type: choice
+        options: [auto, tmate, upterm]
+        default: auto
       minutes:
         description: "Lama sesi SSH (menit, maks 330)"
         default: "300"
       interval:
         description: "Auto-save ke repo tiap berapa detik"
         default: "120"
+      arm64_tools:
+        description: "Pasang toolchain cross-compile ARM64 + QEMU"
+        type: boolean
+        default: false
 
 permissions:
   contents: write
+
+concurrency:
+  group: ssh-workspace
+  cancel-in-progress: false
 
 env:
   WORK: /home/runner/workspace
@@ -43,45 +56,73 @@ jobs:
       - name: Siapkan workdir & tools
         run: |
           mkdir -p $WORK
+          touch $WORK/.keep
           sudo apt-get update
           sudo apt-get install -y build-essential bison flex gawk texinfo bc \
-            libncurses-dev libssl-dev wget xz-utils cpio git \
-            qemu-system-arm qemu-utils qemu-user-static binfmt-support \
-            gcc-aarch64-linux-gnu g++-aarch64-linux-gnu
-          ln -sfn $WORK $HOME/work
+            libncurses-dev libssl-dev wget curl xz-utils cpio git util-linux
+          ln -sfn $WORK $HOME/workdir
           ln -sfn $GITHUB_WORKSPACE $HOME/repo
           git -C $GITHUB_WORKSPACE config user.name "github-actions"
           git -C $GITHUB_WORKSPACE config user.email "github-actions@users.noreply.github.com"
           echo "cd $GITHUB_WORKSPACE" >> $HOME/.bashrc
 
+      - name: Pasang toolchain ARM64 (opsional)
+        if: ${{ inputs.arm64_tools }}
+        run: |
+          sudo apt-get install -y qemu-system-arm qemu-utils qemu-user-static \
+            binfmt-support gcc-aarch64-linux-gnu g++-aarch64-linux-gnu
+
       - name: Pasang script auto-save
         run: |
           cat > $HOME/autosave.sh <<'EOF'
           #!/bin/bash
+          exec 9>/tmp/autosave.lock
+          flock -w 120 9 || exit 0
           cd "$GITHUB_WORKSPACE" || exit 0
-          find . -path ./.git -prune -o -type f -size +90M -print | sed 's|^\./|/|' >> .git/info/exclude
+          find . -path ./.git -prune -o -type f -size +90M -print | sed 's|^\./|/|' | while IFS= read -r f; do
+            grep -qxF "$f" .git/info/exclude 2>/dev/null || echo "$f" >> .git/info/exclude
+          done
           git add -A
           if ! git diff --cached --quiet; then
             git commit -q -m "autosave $(date -u '+%F %T')"
-            git pull --rebase --autostash -q || true
-            git push -q || echo "push gagal, dicoba lagi nanti"
+            git pull --rebase --autostash -q || git rebase --abort
+            git push -q origin HEAD || echo "push gagal, dicoba lagi nanti"
           fi
           EOF
           chmod +x $HOME/autosave.sh
 
       - name: Mulai auto-save loop
         env:
-          INTERVAL: ${{ github.event.inputs.interval }}
+          INTERVAL: ${{ inputs.interval }}
         run: |
-          export GITHUB_WORKSPACE
           RUNNER_TRACKING_ID="" setsid nohup bash -c \
             "while true; do sleep $INTERVAL; $HOME/autosave.sh; done" \
             > $HOME/autosave.log 2>&1 < /dev/null &
           echo "auto-save tiap ${INTERVAL}s"
 
+      - name: Cek koneksi tmate
+        id: net
+        run: |
+          if timeout 15 bash -c 'echo > /dev/tcp/ssh.tmate.io/22'; then
+            echo "TMATE OK"
+            echo "tmate=ok" >> $GITHUB_OUTPUT
+          else
+            echo "TMATE GAGAL"
+            echo "tmate=fail" >> $GITHUB_OUTPUT
+          fi
+
       - name: SSH (tmate)
+        if: ${{ inputs.method == 'tmate' || (inputs.method == 'auto' && steps.net.outputs.tmate == 'ok') }}
         uses: mxschmitt/action-tmate@v3
-        timeout-minutes: ${{ fromJSON(github.event.inputs.minutes) }}
+        timeout-minutes: ${{ fromJSON(inputs.minutes) }}
+        continue-on-error: true
+        with:
+          limit-access-to-actor: true
+
+      - name: SSH (upterm)
+        if: ${{ inputs.method == 'upterm' || (inputs.method == 'auto' && steps.net.outputs.tmate != 'ok') }}
+        uses: lhotari/action-upterm@v1
+        timeout-minutes: ${{ fromJSON(inputs.minutes) }}
         continue-on-error: true
         with:
           limit-access-to-actor: true
