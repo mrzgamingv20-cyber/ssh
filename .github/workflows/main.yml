@@ -1,0 +1,98 @@
+name: SSH Workspace
+
+# Simpan di: .github/workflows/ssh.yml
+on:
+  workflow_dispatch:
+    inputs:
+      minutes:
+        description: "Lama sesi SSH (menit, maks 330)"
+        default: "300"
+      interval:
+        description: "Auto-save ke repo tiap berapa detik"
+        default: "120"
+
+permissions:
+  contents: write
+
+env:
+  WORK: /home/runner/workspace
+
+jobs:
+  ssh:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 350
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Bersihkan disk runner
+        run: |
+          sudo rm -rf /usr/share/dotnet /opt/ghc /usr/local/lib/android || true
+          df -h /
+
+      - name: Restore workdir
+        uses: actions/cache/restore@v4
+        with:
+          path: ${{ env.WORK }}
+          key: workspace-workdir-${{ github.run_id }}
+          restore-keys: workspace-workdir-
+
+      - name: Siapkan workdir & tools
+        run: |
+          mkdir -p $WORK
+          sudo apt-get update
+          sudo apt-get install -y build-essential bison flex gawk texinfo bc \
+            libncurses-dev libssl-dev wget xz-utils cpio git \
+            qemu-system-arm qemu-utils qemu-user-static binfmt-support \
+            gcc-aarch64-linux-gnu g++-aarch64-linux-gnu
+          ln -sfn $WORK $HOME/work
+          ln -sfn $GITHUB_WORKSPACE $HOME/repo
+          git -C $GITHUB_WORKSPACE config user.name "github-actions"
+          git -C $GITHUB_WORKSPACE config user.email "github-actions@users.noreply.github.com"
+          echo "cd $GITHUB_WORKSPACE" >> $HOME/.bashrc
+
+      - name: Pasang script auto-save
+        run: |
+          cat > $HOME/autosave.sh <<'EOF'
+          #!/bin/bash
+          cd "$GITHUB_WORKSPACE" || exit 0
+          find . -path ./.git -prune -o -type f -size +90M -print | sed 's|^\./|/|' >> .git/info/exclude
+          git add -A
+          if ! git diff --cached --quiet; then
+            git commit -q -m "autosave $(date -u '+%F %T')"
+            git pull --rebase --autostash -q || true
+            git push -q || echo "push gagal, dicoba lagi nanti"
+          fi
+          EOF
+          chmod +x $HOME/autosave.sh
+
+      - name: Mulai auto-save loop
+        env:
+          INTERVAL: ${{ github.event.inputs.interval }}
+        run: |
+          export GITHUB_WORKSPACE
+          RUNNER_TRACKING_ID="" setsid nohup bash -c \
+            "while true; do sleep $INTERVAL; $HOME/autosave.sh; done" \
+            > $HOME/autosave.log 2>&1 < /dev/null &
+          echo "auto-save tiap ${INTERVAL}s"
+
+      - name: SSH (tmate)
+        uses: mxschmitt/action-tmate@v3
+        timeout-minutes: ${{ fromJSON(github.event.inputs.minutes) }}
+        continue-on-error: true
+        with:
+          limit-access-to-actor: true
+
+      - name: Auto-save terakhir
+        if: always()
+        run: $HOME/autosave.sh
+
+      - name: Save workdir
+        if: always()
+        uses: actions/cache/save@v4
+        with:
+          path: ${{ env.WORK }}
+          key: workspace-workdir-${{ github.run_id }}
