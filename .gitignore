@@ -1,0 +1,20 @@
+# Arsip & source unduhan
+*.tar
+*.tar.*
+*.tgz
+*.zip
+*.iso
+*.img
+
+# Hasil build
+build/
+out/
+rootfs/
+sources/
+*.o
+*.a
+*.ko
+
+# Sementara
+*.log
+*.tmp
