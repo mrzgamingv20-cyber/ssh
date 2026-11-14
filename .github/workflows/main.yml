@@ -1,139 +1,147 @@
-name: SSH Workspace
+name: Build LFS arm64
 
-# Simpan di: .github/workflows/ssh.yml
+# Simpan di repo publik sebagai: .github/workflows/build.yml
+# Jalankan manual: tab Actions -> Build LFS arm64 -> Run workflow.
+# Tahap dijalankan berurutan: toolchain -> chroot -> system -> config -> image.
+# Tiap tahap memakai checkpoint tahap sebelumnya (disimpan lewat cache).
+# Skrip tiap tahap ada di repo: scripts/stage-<nama>.sh (kecuali tahap image).
+
 on:
   workflow_dispatch:
     inputs:
-      method:
-        description: "Jalur SSH (auto = tmate kalau terjangkau, kalau tidak upterm)"
+      stage:
+        description: "Tahap yang dijalankan"
         type: choice
-        options: [auto, tmate, upterm]
-        default: auto
-      minutes:
-        description: "Lama sesi SSH (menit, maks 330)"
-        default: "300"
-      interval:
-        description: "Auto-save ke repo tiap berapa detik"
-        default: "120"
-      arm64_tools:
-        description: "Pasang toolchain cross-compile ARM64 + QEMU"
-        type: boolean
-        default: false
+        options: [toolchain, chroot, system, config, image]
+        default: toolchain
+      image_size:
+        description: "Ukuran lfs.img (hanya tahap image), contoh 6G"
+        default: "6G"
+      tag:
+        description: "Nama Release untuk hasil (hanya tahap image)"
+        default: "lfs-v1"
 
 permissions:
   contents: write
 
 concurrency:
-  group: ssh-workspace
+  group: lfs-build
   cancel-in-progress: false
 
 env:
-  WORK: /home/runner/workspace
+  WORK: /home/runner/lfs-work
+  LFS: /mnt/lfs
 
 jobs:
-  ssh:
-    runs-on: ubuntu-24.04
+  build:
+    runs-on: ubuntu-24.04-arm
     timeout-minutes: 350
-
+    env:
+      STAGE: ${{ inputs.stage }}
     steps:
       - name: Checkout
         uses: actions/checkout@v4
-        with:
-          fetch-depth: 0
 
-      - name: Bersihkan disk runner
+      - name: Cek mesin
         run: |
-          sudo rm -rf /usr/share/dotnet /opt/ghc /usr/local/lib/android || true
-          df -h /
+          uname -m
+          nproc
+          free -h
+          df -h
 
-      - name: Restore workdir
+      - name: Pasang paket host
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y build-essential bison gawk texinfo m4 patch \
+            python3 xz-utils wget curl zstd e2fsprogs
+
+      - name: Siapkan variabel
+        run: |
+          echo "LFS_TGT=$(uname -m)-lfs-linux-gnu" >> "$GITHUB_ENV"
+          echo "MAKEFLAGS=-j$(nproc)" >> "$GITHUB_ENV"
+
+      - name: Pulihkan checkpoint
         uses: actions/cache/restore@v4
         with:
           path: ${{ env.WORK }}
-          key: workspace-workdir-${{ github.run_id }}
-          restore-keys: workspace-workdir-
+          key: lfs-ckpt-${{ github.run_id }}
+          restore-keys: lfs-ckpt-
 
-      - name: Siapkan workdir & tools
+      - name: Siapkan LFS dari checkpoint sebelumnya
         run: |
-          mkdir -p $WORK
-          touch $WORK/.keep
-          sudo apt-get update
-          sudo apt-get install -y build-essential bison flex gawk texinfo bc \
-            libncurses-dev libssl-dev wget curl xz-utils cpio git util-linux
-          ln -sfn $WORK $HOME/workdir
-          ln -sfn $GITHUB_WORKSPACE $HOME/repo
-          git -C $GITHUB_WORKSPACE config user.name "github-actions"
-          git -C $GITHUB_WORKSPACE config user.email "github-actions@users.noreply.github.com"
-          echo "cd $GITHUB_WORKSPACE" >> $HOME/.bashrc
+          mkdir -p "$WORK"
+          case "$STAGE" in
+            toolchain) PREV="" ;;
+            chroot)    PREV=toolchain ;;
+            system)    PREV=chroot ;;
+            config)    PREV=system ;;
+            image)     PREV=config ;;
+          esac
+          sudo mkdir -p "$LFS"
+          if [ -n "$PREV" ]; then
+            if [ ! -f "$WORK/$PREV.tar.zst" ]; then
+              echo "Checkpoint $PREV tidak ditemukan. Jalankan tahap $PREV dulu."
+              exit 1
+            fi
+            sudo tar -I zstd -xpf "$WORK/$PREV.tar.zst" -C "$LFS"
+          fi
+          df -h "$LFS"
 
-      - name: Pasang toolchain ARM64 (opsional)
-        if: ${{ inputs.arm64_tools }}
+      - name: Jalankan tahap
+        if: ${{ inputs.stage != 'image' }}
         run: |
-          sudo apt-get install -y qemu-system-arm qemu-utils qemu-user-static \
-            binfmt-support gcc-aarch64-linux-gnu g++-aarch64-linux-gnu
+          SCRIPT="scripts/stage-$STAGE.sh"
+          if [ ! -f "$SCRIPT" ]; then
+            echo "File $SCRIPT belum ada di repo."
+            exit 1
+          fi
+          sudo -E bash "$SCRIPT"
 
-      - name: Pasang script auto-save
+      - name: Lepas mount virtual (supaya tidak ikut checkpoint)
+        if: ${{ always() && inputs.stage != 'image' }}
         run: |
-          cat > $HOME/autosave.sh <<'EOF'
-          #!/bin/bash
-          exec 9>/tmp/autosave.lock
-          flock -w 120 9 || exit 0
-          cd "$GITHUB_WORKSPACE" || exit 0
-          find . -path ./.git -prune -o -type f -size +90M -print | sed 's|^\./|/|' | while IFS= read -r f; do
-            grep -qxF "$f" .git/info/exclude 2>/dev/null || echo "$f" >> .git/info/exclude
+          for m in dev/pts dev proc sys run; do
+            sudo umount -R "$LFS/$m" 2>/dev/null || true
           done
-          git add -A
-          if ! git diff --cached --quiet; then
-            git commit -q -m "autosave $(date -u '+%F %T')"
-            git pull --rebase --autostash -q || git rebase --abort
-            git push -q origin HEAD || echo "push gagal, dicoba lagi nanti"
-          fi
-          EOF
-          chmod +x $HOME/autosave.sh
 
-      - name: Mulai auto-save loop
-        env:
-          INTERVAL: ${{ inputs.interval }}
+      - name: Simpan checkpoint
+        if: ${{ success() && inputs.stage != 'image' }}
         run: |
-          RUNNER_TRACKING_ID="" setsid nohup bash -c \
-            "while true; do sleep $INTERVAL; $HOME/autosave.sh; done" \
-            > $HOME/autosave.log 2>&1 < /dev/null &
-          echo "auto-save tiap ${INTERVAL}s"
+          sudo tar --one-file-system -I 'zstd -T0 -3' -cpf "$WORK/$STAGE.tar.zst" -C "$LFS" .
+          sudo chown "$(id -u):$(id -g)" "$WORK/$STAGE.tar.zst"
+          ls -lh "$WORK"
 
-      - name: Cek koneksi tmate
-        id: net
-        run: |
-          if timeout 15 bash -c 'echo > /dev/tcp/ssh.tmate.io/22'; then
-            echo "TMATE OK"
-            echo "tmate=ok" >> $GITHUB_OUTPUT
-          else
-            echo "TMATE GAGAL"
-            echo "tmate=fail" >> $GITHUB_OUTPUT
-          fi
-
-      - name: SSH (tmate)
-        if: ${{ inputs.method == 'tmate' || (inputs.method == 'auto' && steps.net.outputs.tmate == 'ok') }}
-        uses: mxschmitt/action-tmate@v3
-        timeout-minutes: ${{ fromJSON(inputs.minutes) }}
-        continue-on-error: true
-        with:
-          limit-access-to-actor: true
-
-      - name: SSH (upterm)
-        if: ${{ inputs.method == 'upterm' || (inputs.method == 'auto' && steps.net.outputs.tmate != 'ok') }}
-        uses: lhotari/action-upterm@v1
-        timeout-minutes: ${{ fromJSON(inputs.minutes) }}
-        continue-on-error: true
-        with:
-          limit-access-to-actor: true
-
-      - name: Auto-save terakhir
-        if: always()
-        run: $HOME/autosave.sh
-
-      - name: Save workdir
-        if: always()
+      - name: Simpan cache checkpoint
+        if: ${{ success() && inputs.stage != 'image' }}
         uses: actions/cache/save@v4
         with:
           path: ${{ env.WORK }}
-          key: workspace-workdir-${{ github.run_id }}
+          key: lfs-ckpt-${{ github.run_id }}
+
+      - name: Kemas image dan unggah ke Release
+        if: ${{ inputs.stage == 'image' }}
+        env:
+          GH_TOKEN: ${{ github.token }}
+          IMAGE_SIZE: ${{ inputs.image_size }}
+          TAG: ${{ inputs.tag }}
+        run: |
+          set -euo pipefail
+          cd "$HOME"
+          # Ukuran image harus lebih besar dari isi $LFS, kalau tidak mke2fs gagal.
+          truncate -s "$IMAGE_SIZE" lfs.img
+          sudo mke2fs -q -t ext4 -d "$LFS" lfs.img
+          sudo rm -rf "$LFS"
+          zstd -T0 -10 -f lfs.img -o lfs.img.zst
+          rm -f lfs.img
+          ls -lh lfs.img.zst
+          gh release view "$TAG" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1 || \
+            gh release create "$TAG" --repo "$GITHUB_REPOSITORY" \
+              --title "$TAG" --notes "Image LFS arm64 untuk UML"
+          SIZE=$(stat -c %s lfs.img.zst)
+          if [ "$SIZE" -gt 2000000000 ]; then
+            split -b 1900M -d lfs.img.zst lfs.img.zst.part-
+            rm lfs.img.zst
+            gh release upload "$TAG" lfs.img.zst.part-* --clobber --repo "$GITHUB_REPOSITORY"
+          else
+            gh release upload "$TAG" lfs.img.zst --clobber --repo "$GITHUB_REPOSITORY"
+          fi
